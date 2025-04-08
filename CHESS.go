@@ -9,7 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
 	"github.com/notnil/chess"
+	// "github.com/notnil/chess/opening/polyglot" // Removed as it's not found in the module
 )
 
 // Values are from White's POV. Swap number to negative for Black.
@@ -21,7 +23,19 @@ var pawnTable = [64]int{
 	5, 5, 10, 25, 25, 10, 5, 5,
 	0, 0, 0, 20, 20, 0, 0, 0,
 	5, -5, -10, 0, 0, -10, -5, 5,
-	5, 10, 10, -25, -25, 10, 10, 5,
+	5, 10, 10, 20, 20, 10, 10, 5, // Adjusted 7th rank
+	0, 0, 0, 0, 0, 0, 0, 0,
+}
+
+// Endgame pawn table - strongly encourages promotion
+var pawnEndgameTable = [64]int{
+	0, 0, 0, 0, 0, 0, 0, 0,
+	100, 100, 100, 100, 100, 100, 100, 100, // High value for advanced pawns
+	60, 60, 60, 60, 60, 60, 60, 60,
+	40, 40, 40, 40, 40, 40, 40, 40,
+	20, 20, 20, 30, 30, 20, 20, 20,
+	10, 10, 10, 10, 10, 10, 10, 10,
+	5, 5, 5, 5, 5, 5, 5, 5,
 	0, 0, 0, 0, 0, 0, 0, 0,
 }
 
@@ -72,6 +86,18 @@ var kingMidgameTable = [64]int{
 	20, 30, 10, 0, 0, 10, 30, 20,
 }
 
+// King endgame table - encourages king activity towards the center
+var kingEndgameTable = [64]int{
+	-50, -30, -30, -30, -30, -30, -30, -50,
+	-30, -20, 0, 0, 0, 0, -20, -30,
+	-30, -10, 20, 30, 30, 20, -10, -30,
+	-30, -10, 30, 40, 40, 30, -10, -30,
+	-30, -10, 30, 40, 40, 30, -10, -30,
+	-30, -10, 20, 30, 30, 20, -10, -30,
+	-30, -30, 0, 0, 0, 0, -30, -30,
+	-50, -30, -30, -30, -30, -30, -30, -50,
+}
+
 func init() {
 	for i := 0; i < 64; i++ {
 		queenTable[i] = rookTable[i] + bishopTable[i]
@@ -80,8 +106,6 @@ func init() {
 	transpositionTable = make(map[[16]byte]TranspositionEntry, ttSizeEstimate) // Correct map key type
 }
 
-// --- Transposition Table ---
-
 const (
 	ExactScore = iota
 	LowerBound // Alpha score (score is at least this good)
@@ -89,18 +113,16 @@ const (
 )
 
 type TranspositionEntry struct {
-	Hash      [16]byte    
-	Depth     int         // Depth this position was searched to
-	Score     int         // Score found
-	ScoreType int         
+	Hash      [16]byte
+	Depth     int // Depth this position was searched to
+	Score     int // Score found
+	ScoreType int
 	BestMove  *chess.Move // Best move found from this position
 }
-
 
 var transpositionTable map[[16]byte]TranspositionEntry
 var ttSizeEstimate = 1000000
 var ttMutex sync.Mutex
-
 
 // Capturing a higher value piece with a lower value one is prioritized.
 var orderValues = map[chess.PieceType]int{
@@ -119,7 +141,7 @@ func scoreMove(board *chess.Board, move *chess.Move) int {
 	victim := board.Piece(targetSq)
 
 	if victim != chess.NoPiece {
-		attacker := board.Piece(move.S1()) // Piece making the move
+		attacker := board.Piece(move.S1())                                            // Piece making the move
 		return (orderValues[victim.Type()] * 10) - orderValues[attacker.Type()] + 100 // Add 100 base score for any capture
 	}
 
@@ -211,7 +233,7 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 		case chess.Checkmate:
 			// The current player is checkmated, return a very large negative score.
 			return -99999 + (100 - depth) // Adjust score based on depth.
-										  // Otherwise, even if there is a possible checkmate a long way off, it will take it into too much consideration.
+			// Otherwise, even if there is a possible checkmate a long way off, it will take it into too much consideration.
 		case chess.Stalemate:
 			return 0
 		default:
@@ -256,7 +278,6 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 		// Sort in descending order of score (higher score first)
 		return scoreMove(board, validMoves[realI]) > scoreMove(board, validMoves[realJ])
 	})
-	
 
 	for _, move := range validMoves { // Iterate through sorted moves (with TT move first if found)
 		nextPos := pos.Update(move)
@@ -284,11 +305,9 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 		}
 	}
 
-
-
 	var scoreType int
 	if maxScore <= originalAlpha {
-		scoreType = UpperBound 
+		scoreType = UpperBound
 	} else {
 		scoreType = ExactScore
 	}
@@ -339,7 +358,7 @@ func findBestMove(game *chess.Game, depth int) *chess.Move {
 	for i, move := range validMoves {
 		wg.Add(1)
 		currentMove := move
-		moveIndex := i 
+		moveIndex := i
 		go func(m *chess.Move, index int) {
 			defer wg.Done()
 			nextPos := game.Position().Update(m)
@@ -352,23 +371,45 @@ func findBestMove(game *chess.Game, depth int) *chess.Move {
 		}(currentMove, moveIndex)
 	}
 
-
 	go func() {
 		wg.Wait()
 		close(resultsChan)
 	}()
 
+	// Small penalty for choosing a move that leads directly to threefold repetition
+	const repetitionPenalty = -30 // If it's this close, it's really anyone's game still.
+
 	fmt.Println("Waiting for results...") // Debug
 	for result := range resultsChan {
-		fmt.Printf("  * Result received for move %s -> score %d\n", result.move, result.score) // Debug output
-		if result.score > bestScore {
-			bestScore = result.score
+		currentScore := result.score
+
+		// Simulate the move on a temporary game copy
+		tempGame := chess.NewGame(chess.UseNotation(chess.AlgebraicNotation{})) // Use same notation
+		for _, histMove := range game.Moves() {
+			_ = tempGame.Move(histMove) // Replay history - ignore errors for simplicity here
+		}
+		err := tempGame.Move(result.move) // Apply the potential move
+
+		if err == nil { // Check if the move was valid in the temp game
+			outcome := tempGame.Outcome()
+			method := tempGame.Method()
+			if outcome == chess.Draw && method == chess.ThreefoldRepetition {
+				fmt.Printf("  * Move %s leads to threefold repetition draw, applying penalty %d\n", result.move, repetitionPenalty)
+				currentScore += repetitionPenalty // Apply penalty
+			}
+		} else {
+			// This case should ideally not happen if result.move came from game.ValidMoves()
+			fmt.Printf("Warning: Could not apply move %s to temp game simulation: %v\n", result.move, err)
+		}
+
+		fmt.Printf("  * Result received for move %s -> original_score %d, adjusted_score %d\n", result.move, result.score, currentScore) // Debug output
+		if currentScore > bestScore {
+			bestScore = currentScore // Use the potentially adjusted score for comparison
 			bestMove = result.move
 		}
 	}
 	fmt.Println("Finished collecting results.") // Debug
 
-	// --- Final Selection ---
 	if bestMove == nil && numMoves > 0 {
 		// Should not happen if there are valid moves, but as a backup
 		fmt.Println("Warning: No best move found, returning first valid move.")
@@ -379,12 +420,30 @@ func findBestMove(game *chess.Game, depth int) *chess.Move {
 	return bestMove
 }
 
-// Constants for rook evaluation bonuses
 const (
-	rookOpenFileBonus     = 15 // Bonus for rook on a file with no pawns
-	rookSemiOpenFileBonus = 10 // Bonus for rook on a file with only opponent pawns
+	rookOpenFileBonus        = 15   // Bonus for rook on a file with no pawns
+	rookSemiOpenFileBonus    = 10   // Bonus for rook on a file with only opponent pawns
+	endgameMaterialThreshold = 1500 // Threshold for endgame detection (e.g., sum of piece values excluding kings)
 )
 
+func isEndgame(board *chess.Board) bool {
+	materialCount := 0
+	pieceValues := map[chess.PieceType]int{
+		chess.Pawn:   100,
+		chess.Knight: 320,
+		chess.Bishop: 330,
+		chess.Rook:   500,
+		chess.Queen:  900,
+	} // Exclude King
+
+	for sq := chess.A1; sq <= chess.H8; sq++ {
+		piece := board.Piece(sq)
+		if piece != chess.NoPiece && piece.Type() != chess.King {
+			materialCount += pieceValues[piece.Type()]
+		}
+	}
+	return materialCount < endgameMaterialThreshold
+}
 
 func evaluateBoard(pos *chess.Position) int {
 	method := pos.Status()
@@ -400,6 +459,8 @@ func evaluateBoard(pos *chess.Position) int {
 
 	board := pos.Board()
 	score := 0
+	inEndgame := isEndgame(board) // Check if it's endgame
+
 	pieceValues := map[chess.PieceType]int{
 		chess.Pawn:   100,
 		chess.Knight: 320,
@@ -419,21 +480,29 @@ func evaluateBoard(pos *chess.Position) int {
 		sqIndex := int(sq)
 		pstValue := 0 // Initialize PST value
 
-		// Get the base PST value from White's perspective table
+		// Get the base PST value from White's perspective table, considering game phase
 		switch piece.Type() {
 		case chess.Pawn:
-			pstValue = pawnTable[sqIndex]
+			if inEndgame {
+				pstValue = pawnEndgameTable[sqIndex]
+			} else {
+				pstValue = pawnTable[sqIndex]
+			}
 		case chess.Knight:
-			pstValue = knightTable[sqIndex]
+			pstValue = knightTable[sqIndex] // Knight table often used throughout
 		case chess.Bishop:
 			pstValue = bishopTable[sqIndex]
 		case chess.Rook:
 			pstValue = rookTable[sqIndex]
 		case chess.Queen:
-			pstValue = queenTable[sqIndex]
+			pstValue = queenTable[sqIndex] // Queen uses combined rook/bishop
 		case chess.King:
-			// TODO: Add endgame king table logic
-			pstValue = kingMidgameTable[sqIndex]
+			if inEndgame {
+				pstValue = kingEndgameTable[sqIndex]
+			} else {
+				pstValue = kingMidgameTable[sqIndex]
+			}
+
 		}
 
 		rookBonus := 0
@@ -443,7 +512,8 @@ func evaluateBoard(pos *chess.Position) int {
 			opponentPawnsOnFile := 0
 			// Check the file for pawns
 			for rank := chess.Rank1; rank <= chess.Rank8; rank++ {
-				pawnSq := chess.NewSquare(file, rank)
+				// Calculate square index directly instead of using NewSquare
+				pawnSq := chess.Square(int(file) + int(rank)*8)
 				p := board.Piece(pawnSq)
 				if p.Type() == chess.Pawn {
 					if p.Color() == piece.Color() {
@@ -472,10 +542,14 @@ func evaluateBoard(pos *chess.Position) int {
 			// For Black, calculate the flipped square index for PST lookup
 			flippedSqIndex := (7-(sqIndex/8))*8 + (sqIndex % 8)
 			blackPstValue := 0
-			// Get the PST value from the *same* table but using the flipped index
+			// Get the PST value from the *same* table but using the flipped index, considering game phase
 			switch piece.Type() {
 			case chess.Pawn:
-				blackPstValue = pawnTable[flippedSqIndex]
+				if inEndgame {
+					blackPstValue = pawnEndgameTable[flippedSqIndex]
+				} else {
+					blackPstValue = pawnTable[flippedSqIndex]
+				}
 			case chess.Knight:
 				blackPstValue = knightTable[flippedSqIndex]
 			case chess.Bishop:
@@ -485,7 +559,11 @@ func evaluateBoard(pos *chess.Position) int {
 			case chess.Queen:
 				blackPstValue = queenTable[flippedSqIndex]
 			case chess.King:
-				blackPstValue = kingMidgameTable[flippedSqIndex] // TODO: Endgame table
+				if inEndgame {
+					blackPstValue = kingEndgameTable[flippedSqIndex]
+				} else {
+					blackPstValue = kingMidgameTable[flippedSqIndex]
+				}
 			}
 			// Subtract the value from the table entry corresponding to the flipped square
 			score -= blackPstValue
@@ -506,7 +584,6 @@ func main() {
 	var playerColor chess.Color
 	var searchDepth int
 
-	// --- Get Player Color ---
 	for {
 		fmt.Print("Choose your color (white or black): ")
 		input, _ := reader.ReadString('\n')
@@ -522,9 +599,8 @@ func main() {
 		}
 	}
 
-	// --- Get Search Depth ---
 	for {
-		fmt.Print("Enter engine search depth (e.g., 3): ")
+		fmt.Print("Enter engine search depth (6 or 7 recomended): ")
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 		depth, err := strconv.Atoi(input)
@@ -585,9 +661,70 @@ func main() {
 			fmt.Printf("You moved: %s\n", move)
 
 		} else {
-			fmt.Println("Engine is thinking...")
-			move = findBestMove(game, searchDepth)
-			if move == nil {
+			isEngineWhite := playerColor == chess.Black
+			moveCount := len(game.Moves())
+
+			if isEngineWhite && moveCount == 0 {
+				// If engine is White and it's the first move, play e2e4
+				forcedMove, err := chess.AlgebraicNotation{}.Decode(game.Position(), "e4")
+				if err == nil {
+					// Check if e4 is a valid move (it should be at the start)
+					isValid := false
+					for _, validMove := range game.ValidMoves() {
+						if forcedMove.String() == validMove.String() {
+							isValid = true
+							break
+						}
+					}
+					if isValid {
+						move = forcedMove
+						fmt.Println("Engine plays opening: e4")
+					}
+				}
+				// If decoding/validation fails for some reason, fall back to normal search
+				if move == nil {
+					fmt.Println("Warning: Could not force e4, falling back to search.")
+				}
+
+			} else if !isEngineWhite && moveCount == 1 {
+				// If engine is Black and it's the second move (opponent moved first)
+				opponentMove := game.Moves()[0]
+				if opponentMove.String() == "e2e4" {
+					// If opponent played e2e4, play e7e5
+					forcedMove, err := chess.AlgebraicNotation{}.Decode(game.Position(), "e5")
+					if err == nil {
+						// Check if e5 is a valid move
+						isValid := false
+						for _, validMove := range game.ValidMoves() {
+							if forcedMove.String() == validMove.String() {
+								isValid = true
+								break
+							}
+						}
+						if isValid {
+							move = forcedMove
+							fmt.Println("Engine plays opening response: e5")
+						}
+					}
+					// If decoding/validation fails, fall back to normal search
+					if move == nil {
+						fmt.Println("Warning: Could not force e5, falling back to search.")
+					}
+				}
+			}
+
+			if move == nil { // If no opening move was forced, use the engine's calculation
+				currentDepth := searchDepth
+				if isEndgame(game.Position().Board()) {
+					currentDepth++ // Increase depth by 1 in the endgame
+					fmt.Printf("Engine is thinking... (Endgame depth: %d)\n", currentDepth)
+				} else {
+					fmt.Println("Engine is thinking...")
+				}
+				move = findBestMove(game, currentDepth)
+			}
+
+			if move == nil { // Check again after findBestMove
 				fmt.Println("Engine has no moves available.")
 				break
 			}
