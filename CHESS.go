@@ -122,7 +122,7 @@ type TranspositionEntry struct {
 
 var transpositionTable map[[16]byte]TranspositionEntry
 var ttSizeEstimate = 1000000
-var ttMutex sync.Mutex
+var ttMutex sync.RWMutex // Changed to RWMutex
 
 // Capturing a higher value piece with a lower value one is prioritized.
 var orderValues = map[chess.PieceType]int{
@@ -203,9 +203,10 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 	originalAlpha := alpha // Store original alpha for TT storing logic
 	hash := pos.Hash()
 
-	ttMutex.Lock() // Lock before accessing TT
+	// Use Read Lock for checking TT entry
+	ttMutex.RLock()
 	entry, entryExists := transpositionTable[hash]
-	ttMutex.Unlock() // Unlock after accessing TT
+	ttMutex.RUnlock()
 
 	if entryExists && entry.Depth >= depth {
 		switch entry.ScoreType {
@@ -225,8 +226,7 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 		}
 	}
 
-	// Check for checkmate/stalemate *before* depth check.
-	// The score must be relative to the player whose turn it is.
+
 	outcome := pos.Status()
 	if outcome != chess.NoMethod {
 		switch outcome {
@@ -251,10 +251,8 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 	validMoves := pos.ValidMoves()
 
 	var ttMove *chess.Move = nil
-	ttMutex.Lock()
-	entry, entryExists = transpositionTable[hash] // Read again under lock if needed
-	ttMutex.Unlock()
-	if entryExists {
+
+	if entryExists { // Use the entry read initially
 		ttMove = entry.BestMove
 		if ttMove != nil {
 			for i, mv := range validMoves {
@@ -298,10 +296,11 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 				ScoreType: LowerBound,
 				BestMove:  move, // Store the move that caused the cutoff
 			}
-			ttMutex.Lock() // Lock before writing to TT
+			// Use Write Lock for storing TT entry
+			ttMutex.Lock()
 			transpositionTable[hash] = entry
-			ttMutex.Unlock() // Unlock after writing to TT
-			return beta      // Return beta (fail-high)
+			ttMutex.Unlock()
+			return beta // Return beta (fail-high)
 		}
 	}
 
@@ -319,9 +318,10 @@ func negamax(pos *chess.Position, depth, alpha, beta int) int {
 		ScoreType: scoreType,
 		BestMove:  bestMoveInNode, // Store the best move found
 	}
-	ttMutex.Lock() // Lock before writing to TT
+	// Use Write Lock for storing TT entry
+	ttMutex.Lock()
 	transpositionTable[hash] = entry
-	ttMutex.Unlock() // Unlock after writing to TT
+	ttMutex.Unlock()
 
 	return maxScore
 }
@@ -376,44 +376,68 @@ func findBestMove(game *chess.Game, depth int) *chess.Move {
 		close(resultsChan)
 	}()
 
-	// Small penalty for choosing a move that leads directly to threefold repetition
-	const repetitionPenalty = -30 // If it's this close, it's really anyone's game still.
-
+	// Collect all results first
+	allResults := make([]moveResult, 0, numMoves)
 	fmt.Println("Waiting for results...") // Debug
 	for result := range resultsChan {
-		currentScore := result.score
-
-		// Simulate the move on a temporary game copy
-		tempGame := chess.NewGame(chess.UseNotation(chess.AlgebraicNotation{})) // Use same notation
-		for _, histMove := range game.Moves() {
-			_ = tempGame.Move(histMove) // Replay history - ignore errors for simplicity here
-		}
-		err := tempGame.Move(result.move) // Apply the potential move
-
-		if err == nil { // Check if the move was valid in the temp game
-			outcome := tempGame.Outcome()
-			method := tempGame.Method()
-			if outcome == chess.Draw && method == chess.ThreefoldRepetition {
-				fmt.Printf("  * Move %s leads to threefold repetition draw, applying penalty %d\n", result.move, repetitionPenalty)
-				currentScore += repetitionPenalty // Apply penalty
-			}
-		} else {
-			// This case should ideally not happen if result.move came from game.ValidMoves()
-			fmt.Printf("Warning: Could not apply move %s to temp game simulation: %v\n", result.move, err)
-		}
-
-		fmt.Printf("  * Result received for move %s -> original_score %d, adjusted_score %d\n", result.move, result.score, currentScore) // Debug output
-		if currentScore > bestScore {
-			bestScore = currentScore // Use the potentially adjusted score for comparison
-			bestMove = result.move
-		}
+		allResults = append(allResults, result)
+		fmt.Printf("  * Result received for move %s -> score %d\n", result.move, result.score) // Simplified Debug output
 	}
 	fmt.Println("Finished collecting results.") // Debug
 
-	if bestMove == nil && numMoves > 0 {
-		// Should not happen if there are valid moves, but as a backup
-		fmt.Println("Warning: No best move found, returning first valid move.")
-		return validMoves[0]
+	// Sort results by score (highest first)
+	sort.SliceStable(allResults, func(i, j int) bool {
+		return allResults[i].score > allResults[j].score
+	})
+
+	// Find the best non-immediately-repeating move
+	var previousPositionHash [16]byte
+	canCheckRepetition := false
+	positionHistory := game.Positions()
+	historyLen := len(positionHistory)
+
+	// Need at least 3 positions in history to check for immediate repetition (current, previous, the one before previous)
+	if historyLen >= 3 {
+		// The position from 2 moves ago is at index historyLen - 3
+		previousPositionHash = positionHistory[historyLen-3].Hash()
+		canCheckRepetition = true
+	}
+
+	bestMove = nil // Reset bestMove
+	bestScore = math.MinInt32
+
+	for _, result := range allResults {
+		isImmediateRepetition := false
+		if canCheckRepetition {
+			nextPos := game.Position().Update(result.move)
+			if nextPos.Hash() == previousPositionHash {
+				isImmediateRepetition = true
+				fmt.Printf("  * Move %s leads to immediate repetition, considering alternatives...\n", result.move)
+			}
+		}
+
+		if bestMove == nil { // Always select the first move initially
+			bestMove = result.move
+			bestScore = result.score
+		}
+
+		if !isImmediateRepetition {
+			// Found the best move that doesn't immediately repeat
+			bestMove = result.move
+			bestScore = result.score
+			fmt.Printf("  * Selecting non-repeating move: %s (Score: %d)\n", bestMove, bestScore)
+			break // Stop searching for alternatives
+		}
+	}
+
+	if bestMove == nil && len(allResults) > 0 {
+		bestMove = allResults[0].move
+		bestScore = allResults[0].score
+		fmt.Println("  * All top moves lead to immediate repetition or no moves found, choosing highest score move.")
+	} else if bestMove == nil && len(allResults) == 0 {
+		// No valid moves at all
+		fmt.Println("Warning: No valid moves found by the engine.")
+		return nil
 	}
 
 	fmt.Printf("Engine chooses: %s (Score: %d)\n", bestMove, bestScore)
@@ -445,6 +469,67 @@ func isEndgame(board *chess.Board) bool {
 	return materialCount < endgameMaterialThreshold
 }
 
+// isPassedPawn checks if a pawn on a given square is a passed pawn.
+func isPassedPawn(board *chess.Board, sq chess.Square, color chess.Color) bool {
+	file := sq.File()
+	rank := sq.Rank()
+	opponentColor := color.Other()
+
+	// Determine rank direction based on color
+	var rankStep int
+	var endRank chess.Rank
+	if color == chess.White {
+		rankStep = 1 // White pawns move up
+		endRank = chess.Rank8
+	} else {
+		rankStep = -1 // Black pawns move down
+		endRank = chess.Rank1
+	}
+
+	// Check squares in front on the same file and adjacent files
+	for f := file - 1; f <= file+1; f++ {
+		if f < chess.FileA || f > chess.FileH { // Stay within board bounds
+			continue
+		}
+		// Check ranks from the next rank forward to the end rank
+		currentRank := rank + chess.Rank(rankStep)
+		for {
+			// Check if currentRank is valid before creating square
+			if (color == chess.White && currentRank > endRank) || (color == chess.Black && currentRank < endRank) {
+				break // Stop if we've gone past the end rank
+			}
+
+			// Calculate square index directly
+			checkSq := chess.Square(int(f) + int(currentRank)*8)
+
+			// Check if the calculated square is valid (within 0-63)
+			// This check might be redundant given the rank/file checks, but adds safety.
+			if checkSq > chess.H8 {
+				break // Should not happen with rank checks, but safety first
+			}
+
+			piece := board.Piece(checkSq)
+			if piece.Type() == chess.Pawn && piece.Color() == opponentColor {
+				return false // Found an opposing pawn blocking the way
+			}
+
+			// Move to the next rank
+			currentRank += chess.Rank(rankStep)
+
+			// Break condition if already checked the end rank (needed because loop condition checks *after* increment)
+			if (color == chess.White && currentRank > endRank+1) || (color == chess.Black && currentRank < endRank-1) {
+				break
+			}
+		}
+	}
+
+	return true // No opposing pawns found in front
+}
+
+// Bonus for passed pawns based on rank (from White's perspective)
+var passedPawnBonus = [8]int{0, 10, 20, 30, 50, 75, 100, 0} // Index 0/7 unused for pawns
+const bishopPairBonus = 40                                  // Bonus for having both bishops
+
 func evaluateBoard(pos *chess.Position) int {
 	method := pos.Status()
 	if method == chess.Checkmate {
@@ -460,6 +545,8 @@ func evaluateBoard(pos *chess.Position) int {
 	board := pos.Board()
 	score := 0
 	inEndgame := isEndgame(board) // Check if it's endgame
+	whiteBishops := 0
+	blackBishops := 0
 
 	pieceValues := map[chess.PieceType]int{
 		chess.Pawn:   100,
@@ -488,10 +575,28 @@ func evaluateBoard(pos *chess.Position) int {
 			} else {
 				pstValue = pawnTable[sqIndex]
 			}
+			// Moved here from King case
+			if isPassedPawn(board, sq, piece.Color()) {
+				rank := sq.Rank()
+				bonus := 0
+				if piece.Color() == chess.White {
+					bonus = passedPawnBonus[rank] // Use rank directly as index (0-7)
+				} else {
+					// For black, use the flipped rank (rank 1 becomes index 6, rank 6 becomes index 1)
+					bonus = passedPawnBonus[7-rank]
+				}
+				pstValue += bonus // Add bonus to the piece-square value
+				// fmt.Printf("Passed Pawn Bonus: %s on %s gets %d\n", piece.Color(), sq, bonus) // Debug
+			}
 		case chess.Knight:
 			pstValue = knightTable[sqIndex] // Knight table often used throughout
 		case chess.Bishop:
 			pstValue = bishopTable[sqIndex]
+			if piece.Color() == chess.White {
+				whiteBishops++
+			} else {
+				blackBishops++
+			}
 		case chess.Rook:
 			pstValue = rookTable[sqIndex]
 		case chess.Queen:
@@ -502,7 +607,27 @@ func evaluateBoard(pos *chess.Position) int {
 			} else {
 				pstValue = kingMidgameTable[sqIndex]
 			}
+			// Passed pawn bonus logic moved to Pawn case above
 
+			if !inEndgame { // Only apply in middlegame/opening
+				kingFile := sq.File()
+				kingRank := sq.Rank()
+				castlingBonus := 30 // Small bonus for being castled
+
+				if piece.Color() == chess.White {
+					// Bonus if king is likely castled (on g/c file, not original e file)
+					if (kingFile == chess.FileG || kingFile == chess.FileC) && kingRank == chess.Rank1 {
+						pstValue += castlingBonus
+					}
+				} else { // Black King
+					// Bonus if king is likely castled (on g/c file, not original e file)
+					if (kingFile == chess.FileG || kingFile == chess.FileC) && kingRank == chess.Rank8 {
+						// For black, the bonus is added to their pstValue, which is later *subtracted* from the total score.
+						// So, a positive bonus here correctly benefits black.
+						pstValue += castlingBonus
+					}
+				}
+			}
 		}
 
 		rookBonus := 0
@@ -571,6 +696,12 @@ func evaluateBoard(pos *chess.Position) int {
 		}
 	}
 
+	if whiteBishops >= 2 {
+		score += bishopPairBonus
+	}
+	if blackBishops >= 2 {
+		score -= bishopPairBonus
+	}
 	// Return score relative to the side to move
 	if pos.Turn() == chess.White {
 		return score
